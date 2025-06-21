@@ -1,0 +1,21 @@
+{
+  "Command": {
+    "Name": "glueetl",
+    "ScriptLocation": "",
+    "PythonVersion": "3"
+  },
+  "GlueVersion": "5.0",
+  "Role": "",
+  "MaxRetries": 1,
+  "Timeout": 2880,
+  "NumberOfWorkers": 5,
+  "WorkerType": "G.1X",
+  "DefaultArguments": {
+    "--enable-glue-datacatalog": "true",
+    "--job-language": "python",
+    "--TempDir": ""
+  },
+  "Connections": {
+    "Connections": ["BISqlserverConn"]
+  }
+}

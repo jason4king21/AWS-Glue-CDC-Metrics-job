@@ -1,0 +1,61 @@
+name: Deploy AWS Glue Job
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'scripts/**'
+      - 'glue_jobs/**'
+      - '.github/workflows/deploy-glue-job.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      GLUE_ROLE_ARN: ${{ secrets.GLUE_ROLE_ARN }}
+      GLUE_JOB_NAME: ${{ secrets.GLUE_JOB_NAME }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload Glue script to S3
+        run: |
+          aws s3 cp scripts/cdc_metrics_job.py s3://${{ env.S3_BUCKET }}/scripts/cdc_metrics_job.py
+
+      - name: Inject script path and role into config
+        run: |
+          TEMP_DIR="s3://${{ env.S3_BUCKET }}/glue/temp/"
+          SCRIPT_PATH="s3://${{ env.S3_BUCKET }}/scripts/cdc_metrics_job.py"
+
+          jq \
+            --arg script "$SCRIPT_PATH" \
+            --arg role "$GLUE_ROLE_ARN" \
+            --arg temp "$TEMP_DIR" \
+            '.Command.ScriptLocation = $script
+            | .Role = $role
+            | .DefaultArguments["--TempDir"] = $temp' \
+            glue_jobs/glue_job_config.json > job_config_final.json
+
+      - name: Deploy Glue Job
+        run: |
+          set -e
+          if aws glue get-job --job-name "$GLUE_JOB_NAME" > /dev/null 2>&1; then
+            echo "Updating existing Glue job..."
+            aws glue update-job --job-name "$GLUE_JOB_NAME" --job-update file://job_config_final.json
+          else
+            echo "Creating new Glue job..."
+            aws glue create-job --name "$GLUE_JOB_NAME" --cli-input-json file://job_config_final.json
+          fi
+
+      - name: ✅ Done
+        run: echo "Glue Job deployed successfully"
