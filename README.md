@@ -55,6 +55,7 @@ An end-to-end CDC pipeline using **AWS Glue (PySpark)** to extract changes from 
 git clone https://github.com/jason4king21/AWS-Glue-CDC-Metrics-job.git
 cd AWS-Glue-CDC-Metrics-job
 pip install -r requirements.txt
+```
 
 ### 📊 Metrics
 The pipeline outputs in the Gold zone include:
@@ -68,8 +69,9 @@ The pipeline outputs in the Gold zone include:
 
 ### 📱 Streamlit Dashboards
 Run locally:
-'''bash
+```
 streamlit run streamlit_app.py --server.port 8501
+```
 
 ### Available dashboards:
 - Customer Segmentation – RFM & CLV breakdown by loyalty
