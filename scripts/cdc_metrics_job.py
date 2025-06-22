@@ -1,4 +1,8 @@
-
+%idle_timeout 2880
+%glue_version 5.0
+%worker_type G.1X
+%number_of_workers 5
+%connections "BISqlserverConn"
 
 
 import sys
@@ -7,12 +11,6 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-  
-sc = SparkContext.getOrCreate()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql.functions import (
@@ -24,6 +22,13 @@ from datetime import datetime, timedelta
 import boto3
 import time
 import traceback
+  
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+
 
 # --- Init
 spark_context = SparkContext.getOrCreate()
