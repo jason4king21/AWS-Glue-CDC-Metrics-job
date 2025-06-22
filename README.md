@@ -11,8 +11,8 @@ An end-to-end CDC pipeline using **AWS Glue (PySpark)** to extract changes from 
 
 ### Components
 
-1. **AWS RDS (SQL Server)** – Hosts source tables with timestamp-based watermarks.  
-2. **AWS Glue (PySpark)** – Runs CDC logic (full load + incremental watermark diff), joins `order_items`, `order_item_options`, and `date_dim`, and computes metrics.  
+1. **AWS RDS (SQL Server)** – Hosts source tables.  
+2. **AWS Glue (PySpark)** – Runs CDC logic (full load + incremental with date based control and snapshot files), joins `order_items`, `order_item_options`, and `date_dim`, and computes metrics.  
 3. **Amazon S3** – Organized by Bronze/Silver/Gold zones storing Parquet datasets.  
 4. **Streamlit** – Provides interactive dashboards for CLV, RFM, churn risk, sales trends, loyalty impact, location performance, and discount analysis.  
 5. **GitHub Actions** – Automates deployment of Glue scripts and Streamlit dashboard.
@@ -21,7 +21,7 @@ An end-to-end CDC pipeline using **AWS Glue (PySpark)** to extract changes from 
 
 ## 🔧 Tech Stack
 
-- **AWS RDS SQL Server** – Source system with timestamp watermarks  
+- **AWS RDS SQL Server** – Source system  
 - **AWS Glue v3 + PySpark** – CDC and transformation logic  
 - **Amazon S3** – Bronze/Silver/Gold Parquet storage  
 - **Streamlit** – Dashboarding layer  
