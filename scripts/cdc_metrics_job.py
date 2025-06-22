@@ -4,7 +4,8 @@ from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql.functions import (
     col, lit, to_date, when, lag, avg, max, countDistinct,
-    sum as _sum, datediff, current_timestamp
+    sum as _sum, datediff, current_timestamp, row_number, date_format,
+    year, month, weekofyear, hour, concat_ws, dense_rank
 )
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
@@ -314,19 +315,6 @@ rfm_segmented.write.mode("overwrite") \
 
 print("✅ mart_customer_rfm written successfully.")
 
-
-
-
-fs = s3fs.S3FileSystem(anon=False)
-df = pd.read_parquet("s3://jk-business-insights-assessment/data/gold/mart_customer_rfm/part-00001-1708846b-d765-4a69-945b-123f817a7e67-c000.snappy.parquet", filesystem=fs)
-print(df.head())
-
-
-bucket = "jk-business-insights-assessment"
-silver_path = f"s3://{bucket}/data/silver/order_revenue/"
-
-df = spark.read.parquet(silver_path)
-print(df.head())
 
 
 
