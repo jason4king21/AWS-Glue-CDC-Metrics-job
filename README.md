@@ -5,7 +5,7 @@ An end-to-end CDC pipeline using **AWS Glue (PySpark)** to extract changes from 
 ---
 
 ## 🧩 Architecture Overview
-![Architecture Diagram](assets/images/architecture.png)
+![Architecture Diagram](diagrams/architecture.png)
 
 ---
 
