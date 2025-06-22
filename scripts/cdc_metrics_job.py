@@ -1,664 +1,5 @@
-%idle_timeout 2880
-%glue_version 5.0
-%worker_type G.1X
-%number_of_workers 5
-%connections "BISqlserverConn"
-
-
-import sys
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
-from pyspark.sql.functions import (
-    col, lit, to_date, when, lag, avg, max, countDistinct,
-    sum as _sum, datediff
-)
-from pyspark.sql.window import Window
-from datetime import datetime, timedelta
-import boto3
-import time
-import traceback
-  
-sc = SparkContext.getOrCreate()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-
-
-
-# --- Init
-spark_context = SparkContext.getOrCreate()
-glueContext = GlueContext(spark_context)
-spark = glueContext.spark_session
-s3 = boto3.client("s3")
-
-bucket = "jk-business-insights-assessment"
-today = datetime.now()
-today_str = today.strftime("%Y-%m-%d")
-connection_name = "BISqlserverConn"
-
-# ---------- Control Helpers ----------
-def read_control_date(bucket, key, fallback="2020-01-01"):
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return obj["Body"].read().decode("utf-8").strip()
-    except:
-        return fallback
-
-def update_control_date(bucket, key, date_str):
-    s3.put_object(Bucket=bucket, Key=key, Body=date_str)
-    
-def process_silver_order_items():
-    print("🔹 Processing silver_order_items...")
-    control_key = "control/silver_order_items_last_run.txt"
-    last_run = read_control_date(bucket, control_key)
-
-    # Load Bronze CDC
-    df_raw = spark.read.parquet(f"s3://{bucket}/data/bronze/order_items/") \
-                       .withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-                       .filter(col("CREATION_DATE") > last_run)
-
-    if df_raw.rdd.isEmpty():
-        print("✅ No new order_items to process.")
-        return
-
-    df_clean = df_raw \
-        .withColumn("ITEM_PRICE", col("ITEM_PRICE").cast("double")) \
-        .dropDuplicates(["ORDER_ID", "LINEITEM_ID"])
-
-    df_clean.repartition("CREATION_DATE").write.mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_items/")
-
-    max_date = df_clean.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ silver_order_items processed through {max_date}")
-    
-def process_silver_order_item_options():
-    print("🔹 Processing silver_order_item_options...")
-    control_key = "control/silver_order_item_options_last_run.txt"
-    last_run = read_control_date(bucket, control_key)
-
-    df_raw_opts = spark.read.parquet(f"s3://{bucket}/data/bronze/order_item_options/") \
-                             .withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-                             .filter(col("CREATION_DATE") > last_run)
-
-    if df_raw_opts.rdd.isEmpty():
-        print("✅ No new order_item_options to process.")
-        return
-
-    df_opts = df_raw_opts \
-        .withColumn("OPTION_PRICE", col("OPTION_PRICE").cast("double")) \
-        .dropDuplicates(["ORDER_ID", "LINEITEM_ID"])
-
-    df_opts.repartition("CREATION_DATE").write.mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_item_options/")
-
-    max_date = df_opts.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ silver_order_item_options processed through {max_date}")
-
-def process_silver_order_revenue():
-    print("🔹 Processing silver_order_revenue...")
-    df_items = spark.read.parquet(f"s3://{bucket}/data/silver/order_items/")
-    df_options = spark.read.parquet(f"s3://{bucket}/data/silver/order_item_options/")
-
-    df_revenue = df_items.join(
-        df_options,
-        on=["ORDER_ID", "LINEITEM_ID"],
-        how="left"
-    ).withColumn("OPTION_PRICE", col("OPTION_PRICE").na.fill(0.0)) \
-     .withColumn("TOTAL_REVENUE", col("ITEM_PRICE") + col("OPTION_PRICE"))
-
-    df_revenue.repartition("CREATION_DATE").write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_revenue/")
-
-    print("✅ silver_order_revenue written successfully.")
-
-
-# ---------- Metric Functions ----------
-def calculate_ltv(df_orders):
-    control_key = "control/fact_ltv_last_run.txt"
-    last_processed = read_control_date(bucket, control_key)
-
-    df_orders = df_orders.withColumn("ITEM_PRICE", col("ITEM_PRICE").cast("double")) \
-                         .withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-                         .filter(col("CREATION_DATE") > last_processed)
-
-    if df_orders.rdd.isEmpty():
-        print("✅ No new LTV data to process.")
-        return
-
-    df_daily = df_orders.groupBy("USER_ID", "CREATION_TIME_UTC", "CREATION_DATE") \
-                        .agg(_sum("ITEM_PRICE").alias("daily_revenue"))
-
-    window_spec = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC") \
-                        .rowsBetween(Window.unboundedPreceding, 0)
-
-    df_ltv = df_daily.withColumn("cumulative_ltv", _sum("daily_revenue").over(window_spec))
-    df_ltv = df_ltv.coalesce(10)
-
-    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-
-    df_ltv.write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/gold/fact_ltv_daily/")
-
-    max_date = df_ltv.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ LTV processed through {max_date}")
-
-def calculate_rfm(df_orders):
-    control_key = "control/fact_rfm_last_run.txt"
-    last_run_date = read_control_date(bucket, control_key)
-
-    df_recent = df_orders.withColumn("order_date", to_date("CREATION_TIME_UTC")) \
-                         .filter(col("order_date") > last_run_date)
-
-    if df_recent.rdd.isEmpty():
-        print("✅ No new RFM data to process.")
-        return
-
-    df_rfm = df_recent.groupBy("USER_ID").agg(
-        _sum("ITEM_PRICE").alias("monetary_3mo"),
-        countDistinct("ORDER_ID").alias("frequency_3mo"),
-        max("order_date").alias("last_order_date")
-    ).withColumn("recency_days", datediff(lit(today_str), col("last_order_date")))
-
-    df_rfm = df_rfm.withColumn("segment", when((col("recency_days") <= 10) & (col("frequency_3mo") > 5), "VIP")
-        .when((col("recency_days") > 45) & (col("frequency_3mo") <= 2), "Churn Risk")
-        .when((col("recency_days") <= 15) & (col("frequency_3mo") <= 2), "New")
-        .otherwise("Regular"))
-
-    df_rfm.coalesce(1).write.mode("overwrite") \
-          .option("compression", "snappy") \
-          .parquet(f"s3://{bucket}/data/gold/mart_customer_rfm/")
-
-    max_date = df_recent.agg({"order_date": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ RFM processed through {max_date}")
-
-def calculate_churn_indicators(df_orders):
-    control_key = "control/fact_churn_last_run.txt"
-    last_run_date = read_control_date(bucket, control_key)
-
-    df_filtered = df_orders.withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-                           .filter(col("CREATION_DATE") > last_run_date)
-
-    if df_filtered.rdd.isEmpty():
-        print("✅ No new churn indicator data to process.")
-        return
-
-    window = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC")
-    df = df_filtered.withColumn("prev_order", lag("CREATION_TIME_UTC").over(window))
-    df = df.withColumn("gap_days", (col("CREATION_TIME_UTC").cast("long") - col("prev_order").cast("long")) / 86400)
-
-    df = df.groupBy("USER_ID").agg(
-        datediff(lit(today_str), max("CREATION_TIME_UTC")).alias("days_since_last"),
-        avg("gap_days").alias("avg_order_gap_days"),
-        _sum("ITEM_PRICE").alias("total_spend")
-    ).withColumn("churn_flag", when(col("days_since_last") > 45, "at_risk").otherwise("active"))
-
-    df.coalesce(1).write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_churn_indicators/")
-
-    max_date = df_filtered.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ Churn indicators processed through {max_date}")
-
-def calculate_sales_trends(df_orders):
-    control_key = "control/fact_sales_trends_last_run.txt"
-    last_processed = read_control_date(bucket, control_key)
-
-    df = df_orders.withColumn("order_date", to_date("CREATION_TIME_UTC")) \
-                  .filter(col("order_date") > last_processed)
-
-    if df.rdd.isEmpty():
-        print("✅ No new sales trend data to process.")
-        return
-
-    df.groupBy("order_date").agg(_sum("ITEM_PRICE").alias("daily_sales")) \
-        .coalesce(1).write.mode("append") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_sales_trends/")
-
-    max_date = df.agg({"order_date": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ Sales trends updated through {max_date}")
-
-def calculate_loyalty_impact(df_orders):
-    df_orders.groupBy("USER_ID", "IS_LOYALTY").agg(
-        _sum("ITEM_PRICE").alias("total_spend"),
-        countDistinct("ORDER_ID").alias("order_count")
-    ).coalesce(1).write.mode("overwrite") \
-     .option("compression", "snappy") \
-     .parquet(f"s3://{bucket}/data/gold/mart_loyalty_impact/")
-
-def calculate_discount_effectiveness(df_orders, df_options):
-    df_options = df_options.withColumn("OPTION_PRICE", col("OPTION_PRICE").cast("double"))
-    df_orders = df_orders.withColumn("ITEM_PRICE", col("ITEM_PRICE").cast("double"))
-
-    df_joined = df_orders.join(
-        df_options,
-        on=["ORDER_ID", "LINEITEM_ID"],
-        how="left"
-    ).withColumn("is_discounted", col("OPTION_PRICE") < 0)
-
-    df_result = df_joined.groupBy("is_discounted").agg(
-        _sum("ITEM_PRICE").alias("revenue"),
-        countDistinct("ORDER_ID").alias("order_count")
-    )
-
-    df_result.coalesce(1).write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_discount_effectiveness/")
-
-    print("✅ Discount effectiveness calculation complete.")
-
-# ---------- Unified Runner ----------
-def metrics_runner(df_orders, df_options):
-    metrics = {
-        "Customer LTV": lambda: calculate_ltv(df_orders),
-        "RFM Segmentation": lambda: calculate_rfm(df_orders),
-        "Churn Indicators": lambda: calculate_churn_indicators(df_orders),
-        "Sales Trends": lambda: calculate_sales_trends(df_orders),
-        "Loyalty Impact": lambda: calculate_loyalty_impact(df_orders),
-        "Discount Effectiveness": lambda: calculate_discount_effectiveness(df_orders, df_options)
-    }
-
-    print("\n🔁 Starting metrics pipeline...\n")
-
-    for name, func in metrics.items():
-        print(f"➡️ Running: {name}")
-        start_time = time.time()
-        try:
-            func()
-            elapsed = round(time.time() - start_time, 2)
-            print(f"✅ {name} completed in {elapsed} sec\n")
-        except Exception as e:
-            print(f"❌ {name} failed: {str(e)}")
-            traceback.print_exc()
-            continue
-
-    print("🏁 All metric tasks attempted.\n")
-
-# ---------- ETL Loader ----------
-def load_and_run():
-    print("\n🔁 Starting Silver Layer Processing with CDC...\n")
-    process_silver_order_items()
-    process_silver_order_item_options()
-    process_silver_order_revenue()
-
-    print("\n✅ Silver Layer complete. Loading clean data for metrics...\n")
-
-    df_orders = spark.read.parquet(f"s3://{bucket}/data/silver/order_revenue/")
-    df_options = spark.read.parquet(f"s3://{bucket}/data/silver/order_item_options/")
-
-    metrics_runner(df_orders, df_options)
-
-
-# Run main loader
-load_and_run()
-
-
-from pyspark.sql.functions import col, to_date
-from datetime import datetime
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
-
-spark_context = SparkContext.getOrCreate()
-glueContext = GlueContext(spark_context)
-spark = glueContext.spark_session
-
-bucket = "jk-business-insights-assessment"
-today_str = datetime.now().strftime("%Y-%m-%d")
-
-def process_silver_order_items():
-    control_key = "control/silver_order_items_last_run.txt"
-    last_run = read_control_date(bucket, control_key)
-
-    df_raw = spark.read.parquet(f"s3://{bucket}/data/bronze/order_items/") \
-        .withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-        .filter(col("CREATION_DATE") > last_run)
-
-    if df_raw.rdd.isEmpty():
-        print("✅ No new order_items to process.")
-        return
-
-    df_clean = df_raw.withColumn("ITEM_PRICE", col("ITEM_PRICE").cast("double")) \
-                     .dropDuplicates(["ORDER_ID", "LINEITEM_ID"])
-
-    df_clean.repartition("CREATION_DATE").write.mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_items/")
-
-    max_date = df_clean.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ silver_order_items processed through {max_date}")
-
-def process_silver_order_item_options():
-    control_key = "control/silver_order_item_options_last_run.txt"
-    last_run = read_control_date(bucket, control_key)
-
-    df_raw_opts = spark.read.parquet(f"s3://{bucket}/data/bronze/order_item_options/") \
-        .withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC")) \
-        .filter(col("CREATION_DATE") > last_run)
-
-    if df_raw_opts.rdd.isEmpty():
-        print("✅ No new order_item_options to process.")
-        return
-
-    df_opts = df_raw_opts.withColumn("OPTION_PRICE", col("OPTION_PRICE").cast("double")) \
-                         .dropDuplicates(["ORDER_ID", "LINEITEM_ID"])
-
-    df_opts.repartition("CREATION_DATE").write.mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_item_options/")
-
-    max_date = df_opts.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ silver_order_item_options processed through {max_date}")
-
-def process_silver_order_revenue():
-    df_items = spark.read.parquet(f"s3://{bucket}/data/silver/order_items/")
-    df_options = spark.read.parquet(f"s3://{bucket}/data/silver/order_item_options/")
-
-    df_revenue = df_items.join(df_options, ["ORDER_ID", "LINEITEM_ID"], "left") \
-        .withColumn("OPTION_PRICE", col("OPTION_PRICE").na.fill(0.0)) \
-        .withColumn("TOTAL_REVENUE", col("ITEM_PRICE") + col("OPTION_PRICE"))
-
-    df_revenue.repartition("CREATION_DATE").write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/silver/order_revenue/")
-
-    print("✅ silver_order_revenue written successfully.")
-    
-from pyspark.sql.functions import col, lit, to_date, when, lag, avg, max, countDistinct, sum as _sum, datediff
-from pyspark.sql.window import Window
-
-def calculate_ltv(df_orders):
-    control_key = "control/fact_ltv_last_run.txt"
-    last_processed = read_control_date(bucket, control_key)
-
-    df_orders = df_orders.filter(col("CREATION_DATE") > last_processed)
-
-    if df_orders.rdd.isEmpty():
-        print("✅ No new LTV data to process.")
-        return
-
-    df_daily = df_orders.groupBy("USER_ID", "CREATION_DATE", "CREATION_TIME_UTC") \
-                        .agg(_sum("TOTAL_REVENUE").alias("daily_revenue"))
-
-    window_spec = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC") \
-                        .rowsBetween(Window.unboundedPreceding, 0)
-
-    df_ltv = df_daily.withColumn("cumulative_ltv", _sum("daily_revenue").over(window_spec))
-
-    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-
-    df_ltv.repartition("CREATION_DATE").write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .partitionBy("CREATION_DATE") \
-        .parquet(f"s3://{bucket}/data/gold/fact_ltv_daily/")
-
-    max_date = df_ltv.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ LTV processed through {max_date}")
-
-def calculate_rfm(df_orders):
-    control_key = "control/fact_rfm_last_run.txt"
-    last_run_date = read_control_date(bucket, control_key)
-
-    df_recent = df_orders.filter(col("CREATION_DATE") > last_run_date)
-
-    if df_recent.rdd.isEmpty():
-        print("✅ No new RFM data to process.")
-        return
-
-    df_rfm = df_recent.groupBy("USER_ID").agg(
-        _sum("TOTAL_REVENUE").alias("monetary_3mo"),
-        countDistinct("ORDER_ID").alias("frequency_3mo"),
-        max("CREATION_DATE").alias("last_order_date")
-    ).withColumn("recency_days", datediff(lit(today_str), col("last_order_date")))
-
-    df_rfm = df_rfm.withColumn("segment", when((col("recency_days") <= 10) & (col("frequency_3mo") > 5), "VIP")
-        .when((col("recency_days") > 45) & (col("frequency_3mo") <= 2), "Churn Risk")
-        .when((col("recency_days") <= 15) & (col("frequency_3mo") <= 2), "New")
-        .otherwise("Regular"))
-
-    df_rfm.coalesce(1).write.mode("overwrite") \
-          .option("compression", "snappy") \
-          .parquet(f"s3://{bucket}/data/gold/mart_customer_rfm/")
-
-    max_date = df_recent.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ RFM processed through {max_date}")
-
-def calculate_churn_indicators(df_orders):
-    control_key = "control/fact_churn_last_run.txt"
-    last_run_date = read_control_date(bucket, control_key)
-
-    df_filtered = df_orders.filter(col("CREATION_DATE") > last_run_date)
-
-    if df_filtered.rdd.isEmpty():
-        print("✅ No new churn indicator data to process.")
-        return
-
-    window = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC")
-    df = df_filtered.withColumn("prev_order", lag("CREATION_TIME_UTC").over(window)) \
-                    .withColumn("gap_days", (col("CREATION_TIME_UTC").cast("long") - col("prev_order").cast("long")) / 86400)
-
-    df = df.groupBy("USER_ID").agg(
-        datediff(lit(today_str), max("CREATION_TIME_UTC")).alias("days_since_last"),
-        avg("gap_days").alias("avg_order_gap_days"),
-        _sum("TOTAL_REVENUE").alias("total_spend")
-    ).withColumn("churn_flag", when(col("days_since_last") > 45, "at_risk").otherwise("active"))
-
-    df.coalesce(1).write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_churn_indicators/")
-
-    max_date = df_filtered.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ Churn indicators processed through {max_date}")
-
-def calculate_sales_trends(df_orders):
-    control_key = "control/fact_sales_trends_last_run.txt"
-    last_processed = read_control_date(bucket, control_key)
-
-    df = df_orders.filter(col("CREATION_DATE") > last_processed)
-
-    if df.rdd.isEmpty():
-        print("✅ No new sales trend data to process.")
-        return
-
-    df.groupBy("CREATION_DATE").agg(_sum("TOTAL_REVENUE").alias("daily_sales")) \
-        .coalesce(1).write.mode("append") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_sales_trends/")
-
-    max_date = df.agg({"CREATION_DATE": "max"}).collect()[0][0].strftime("%Y-%m-%d")
-    update_control_date(bucket, control_key, max_date)
-    print(f"✅ Sales trends updated through {max_date}")
-
-def calculate_loyalty_impact(df_orders):
-    df_orders.groupBy("USER_ID", "IS_LOYALTY").agg(
-        _sum("TOTAL_REVENUE").alias("total_spend"),
-        countDistinct("ORDER_ID").alias("order_count")
-    ).coalesce(1).write.mode("overwrite") \
-     .option("compression", "snappy") \
-     .parquet(f"s3://{bucket}/data/gold/mart_loyalty_impact/")
-
-def calculate_discount_effectiveness(df_orders, df_options):
-    df_joined = df_orders.join(
-        df_options,
-        on=["ORDER_ID", "LINEITEM_ID"],
-        how="left"
-    ).withColumn("is_discounted", col("OPTION_PRICE") < 0)
-
-    df_result = df_joined.groupBy("is_discounted").agg(
-        _sum("TOTAL_REVENUE").alias("revenue"),
-        countDistinct("ORDER_ID").alias("order_count")
-    )
-
-    df_result.coalesce(1).write.mode("overwrite") \
-        .option("compression", "snappy") \
-        .parquet(f"s3://{bucket}/data/gold/mart_discount_effectiveness/")
-
-    print("✅ Discount effectiveness calculation complete.")
-    
-# ---------- Control File ----------
-def get_last_run_time():
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=control_key)
-        return obj["Body"].read().decode("utf-8").strip()
-    except:
-        return "2020-01-01"
-
-def update_last_run_time(new_time):
-    s3.put_object(Bucket=bucket, Key=control_key, Body=new_time)
-
-# ---------- Metric Functions ----------
-def calculate_ltv(df_orders):
-    df_daily = df_orders.groupBy("USER_ID", "CREATION_TIME_UTC").agg(_sum("ITEM_PRICE").alias("daily_revenue"))
-    window_spec = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC")
-    df_ltv = df_daily.withColumn("cumulative_ltv", _sum("daily_revenue").over(window_spec))
-    df_ltv.write.mode("append").partitionBy("USER_ID").parquet(f"s3://{bucket}/data/gold/fact_ltv_daily/")
-
-def calculate_rfm(df_orders):
-    df_recent = df_orders.withColumn("order_date", to_date("CREATION_TIME_UTC"))
-    window_start = (today - timedelta(days=90)).strftime("%Y-%m-%d")
-    df_recent = df_recent.filter(col("order_date") >= lit(window_start))
-    df_rfm = df_recent.groupBy("USER_ID").agg(
-        _sum("ITEM_PRICE").alias("monetary_3mo"),
-        _sum(lit(1)).alias("frequency_3mo"),
-        max("order_date").alias("last_order_date")
-    )
-    df_rfm = df_rfm.withColumn("recency_days", (lit(today_str).cast("date") - col("last_order_date")).cast("int"))
-    df_rfm = df_rfm.withColumn("segment", when((col("recency_days") <= 10) & (col("frequency_3mo") > 5), "VIP")
-        .when((col("recency_days") > 45) & (col("frequency_3mo") <= 2), "Churn Risk")
-        .when((col("recency_days") <= 15) & (col("frequency_3mo") <= 2), "New")
-        .otherwise("Regular"))
-    df_rfm.write.mode("overwrite").parquet(f"s3://{bucket}/data/gold/mart_customer_rfm/")
-
-def calculate_churn_indicators(df_orders):
-    window = Window.partitionBy("USER_ID").orderBy("CREATION_TIME_UTC")
-    df = df_orders.withColumn("prev_order", lag("CREATION_TIME_UTC").over(window))
-    df = df.withColumn("gap_days", (col("CREATION_TIME_UTC").cast("long") - col("prev_order").cast("long")) / 86400)
-    df = df.groupBy("USER_ID").agg(
-        datediff(lit(today_str), max("CREATION_TIME_UTC")).alias("days_since_last"),
-        avg("gap_days").alias("avg_order_gap_days"),
-        _sum("ITEM_PRICE").alias("total_spend")
-    ).withColumn("churn_flag", when(col("days_since_last") > 45, "at_risk").otherwise("active"))
-    df.write.mode("overwrite").parquet(f"s3://{bucket}/data/gold/mart_churn_indicators/")
-
-def calculate_sales_trends(df_orders):
-    df = df_orders.withColumn("order_date", to_date("CREATION_TIME_UTC"))
-    df.groupBy("order_date").agg(_sum("ITEM_PRICE").alias("daily_sales")) \
-        .write.mode("append").parquet(f"s3://{bucket}/data/gold/mart_sales_trends/")
-
-def calculate_loyalty_impact(df_orders):
-    df_orders.groupBy("USER_ID", "IS_LOYALTY_MEMBER").agg(
-        _sum("ITEM_PRICE").alias("total_spend"),
-        _sum(lit(1)).alias("order_count")
-    ).write.mode("overwrite").parquet(f"s3://{bucket}/data/gold/mart_loyalty_impact/")
-
-def calculate_discount_effectiveness(df_orders):
-    df = df_orders.withColumn("is_discounted", col("OPTION_PRICE") < 0)
-    df.groupBy("is_discounted").agg(
-        _sum("ITEM_PRICE").alias("revenue"),
-        _sum(lit(1)).alias("order_count")
-    ).write.mode("overwrite").parquet(f"s3://{bucket}/data/gold/mart_discount_effectiveness/")
-
-# ---------- ETL Loop ----------
-tables = [
-    {"name": "order_items", "primary_keys": ["ORDER_ID", "LINEITEM_ID"], "calculate_ltv": True},
-    {"name": "order_item_options", "primary_keys": ["ORDER_ID", "LINEITEM_ID", "OPTION_NAME"], "calculate_ltv": False},
-    {"name": "date_dim", "primary_keys": ["date_key"], "calculate_ltv": False}
-]
-
-for table in tables:
-    table_name = table["name"]
-    primary_keys = table["primary_keys"]
-    calculate_ltv_flag = table["calculate_ltv"]
-
-    raw_path = f"s3://{bucket}/data/bronze/{table_name}/{today_str}/"
-    cdc_path = f"s3://{bucket}/data/cdc/{table_name}/date={today_str}/"
-    snapshot_path = f"s3://{bucket}/data/snapshots/{table_name}/latest/"
-
-    if table_name == "order_items":
-        last_run_time = get_last_run_time()
-        dynamic_frame = glueContext.create_dynamic_frame.from_options(
-            connection_type="sqlserver",
-            connection_options={
-                "connectionName": connection_name,
-                "dbtable": "order_items",
-                "customSql": f"SELECT * FROM order_items WHERE CREATION_TIME_UTC >= '{last_run_time}'",
-                "useConnectionProperties": True
-            }
-        )
-    else:
-        dynamic_frame = glueContext.create_dynamic_frame.from_options(
-            connection_type="sqlserver",
-            connection_options={
-                "connectionName": connection_name,
-                "dbtable": table_name,
-                "useConnectionProperties": True
-            }
-        )
-
-    df_current = dynamic_frame.toDF().dropDuplicates()
-    df_current.write.mode("overwrite").parquet(raw_path)
-
-    if table_name == "order_items":
-        df_cdc = df_current.withColumn("cdc_action", lit("insert"))
-        df_cdc.write.mode("append").partitionBy("cdc_action").parquet(cdc_path)
-        update_last_run_time(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    else:
-        try:
-            df_previous = spark.read.parquet(snapshot_path)
-        except:
-            df_previous = spark.createDataFrame([], df_current.schema)
-
-        non_pk_cols = [c for c in df_current.columns if c not in primary_keys]
-        df_inserts = df_current.subtract(df_previous).withColumn("cdc_action", lit("insert"))
-        df_deletes = df_previous.subtract(df_current).withColumn("cdc_action", lit("delete"))
-        join_expr = [df_current[k] == df_previous[k] for k in primary_keys]
-        df_joined = df_current.alias("curr").join(df_previous.alias("prev"), join_expr, "inner")
-        df_updates = df_joined.filter(" OR ".join([f"curr.{c} <> prev.{c}" for c in non_pk_cols])) \
-            .select("curr.*").withColumn("cdc_action", lit("update"))
-        df_cdc = df_inserts.union(df_updates).union(df_deletes)
-        df_cdc.write.mode("overwrite").partitionBy("cdc_action").parquet(cdc_path)
-        df_current.write.mode("overwrite").parquet(snapshot_path)
-
-    # ---- Metrics for order_items
-    if calculate_ltv_flag:
-        df_valid_orders = df_cdc.filter(col("cdc_action") != "delete")
-
-        calculate_ltv(df_valid_orders)
-        calculate_rfm(df_valid_orders)
-        calculate_churn_indicators(df_valid_orders)
-        calculate_sales_trends(df_valid_orders)
-        calculate_loyalty_impact(df_valid_orders)
-        calculate_discount_effectiveness(df_valid_orders)
-
-print("✅ Full CDC + Metrics pipeline complete for", today_str)
-
-
+import s3fs
+import pandas as pd
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql.functions import (
@@ -670,6 +11,8 @@ from datetime import datetime, timedelta
 import boto3
 import time
 import traceback
+
+
 
 # --- Init
 spark_context = SparkContext.getOrCreate()
@@ -767,17 +110,6 @@ for table in tables:
         df_cdc.write.mode("overwrite").partitionBy("cdc_action").parquet(cdc_path)
         df_current.write.mode("overwrite").parquet(snapshot_path)
 
-from pyspark.sql.functions import col, to_date
-from datetime import datetime
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
-
-spark_context = SparkContext.getOrCreate()
-glueContext = GlueContext(spark_context)
-spark = glueContext.spark_session
-
-bucket = "jk-business-insights-assessment"
-today_str = datetime.now().strftime("%Y-%m-%d")
 
 # ---------- Control File ----------
 def read_control_date(bucket, control_key):
@@ -888,11 +220,6 @@ process_silver_order_item_options()
 process_silver_date_dim()
 process_silver_order_revenue()
 
-from pyspark.sql.functions import to_date, sum as _sum
-from pyspark.sql.window import Window
-
-bucket = "jk-business-insights-assessment"
-today_str = datetime.now().strftime("%Y-%m-%d")
 
 df = spark.read.parquet(f"s3://{bucket}/data/silver/order_revenue/")
 df = df.withColumn("CREATION_DATE", to_date("CREATION_TIME_UTC"))
@@ -911,13 +238,6 @@ df_ltv.write.mode("overwrite") \
     .parquet(f"s3://{bucket}/data/gold/fact_ltv_daily/")
 
 
-from pyspark.sql.functions import max as _max
-from pyspark.sql.functions import row_number
-import pandas as pd
-
-
-bucket = "jk-business-insights-assessment"
-today_str = datetime.now().strftime("%Y-%m-%d")
 
 # Read fact_ltv_daily
 df = spark.read.parquet(f"s3://{bucket}/data/gold/fact_ltv_daily/")
@@ -945,11 +265,6 @@ df_out = spark.createDataFrame(df_pd)
 df_out.write.mode("overwrite").parquet(f"s3://{bucket}/data/gold/mart_customer_clv_segment/")
 
 
-
-from pyspark.sql.functions import col, max, countDistinct, sum as _sum, datediff, lit, to_date
-from datetime import datetime, timedelta
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
 
 # Setup
 glueContext = GlueContext(SparkContext.getOrCreate())
@@ -1000,8 +315,7 @@ rfm_segmented.write.mode("overwrite") \
 print("✅ mart_customer_rfm written successfully.")
 
 
-import s3fs
-import pandas as pd
+
 
 fs = s3fs.S3FileSystem(anon=False)
 df = pd.read_parquet("s3://jk-business-insights-assessment/data/gold/mart_customer_rfm/part-00001-1708846b-d765-4a69-945b-123f817a7e67-c000.snappy.parquet", filesystem=fs)
@@ -1014,21 +328,11 @@ silver_path = f"s3://{bucket}/data/silver/order_revenue/"
 df = spark.read.parquet(silver_path)
 print(df.head())
 
-from pyspark.sql.functions import col, max, lag, avg, sum as _sum, datediff, to_date, lit, when
-from pyspark.sql.window import Window
-from datetime import datetime, timedelta
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
 
-# Setup
-glueContext = GlueContext(SparkContext.getOrCreate())
-spark = glueContext.spark_session
 
-bucket = "jk-business-insights-assessment"
 silver_path = f"s3://{bucket}/data/silver/order_revenue/"
 gold_path = f"s3://{bucket}/data/gold/mart_customer_churn_profile/"
-today = datetime.now()
-today_str = today.strftime("%Y-%m-%d")
+
 
 # Load silver data
 df = spark.read.parquet(silver_path)
@@ -1080,13 +384,6 @@ df_churn.write.mode("overwrite") \
 
 print("✅ mart_customer_churn_profile written successfully.")
 
-
-from pyspark.sql.functions import (
-    col, to_date, date_format, sum as _sum, year, month, weekofyear, hour, concat_ws
-)
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
-from datetime import datetime
 
 # Setup
 glueContext = GlueContext(SparkContext.getOrCreate())
@@ -1148,15 +445,9 @@ hourly.write.mode("overwrite").option("compression", "snappy") \
 print("✅ mart_sales_trends written successfully (daily, weekly, monthly, hourly).")
 
 
-from pyspark.sql.functions import (
-    col, sum as _sum, countDistinct, count, when, avg
-)
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
 
-# Setup
-glueContext = GlueContext(SparkContext.getOrCreate())
-spark = glueContext.spark_session
+
+
 
 bucket = "jk-business-insights-assessment"
 path_items = f"s3://{bucket}/data/silver/order_items/"
@@ -1199,17 +490,7 @@ df_summary.write.mode("overwrite") \
 print("✅ mart_loyalty_program_impact written successfully.")
 
 
-from pyspark.sql.functions import (
-    col, sum as _sum, countDistinct, count, avg, to_date,
-    year, weekofyear, countDistinct, dense_rank
-)
-from pyspark.sql.window import Window
-from awsglue.context import GlueContext
-from pyspark.context import SparkContext
 
-# Setup
-glueContext = GlueContext(SparkContext.getOrCreate())
-spark = glueContext.spark_session
 
 bucket = "jk-business-insights-assessment"
 path_items = f"s3://{bucket}/data/silver/order_items/"
