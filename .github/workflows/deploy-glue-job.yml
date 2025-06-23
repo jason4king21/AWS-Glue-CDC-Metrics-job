@@ -1,4 +1,4 @@
-name: Deploy AWS Glue Job
+name: Deploy AWS Glue Jobs
 
 on:
   push:
@@ -14,7 +14,6 @@ jobs:
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       GLUE_ROLE_ARN: ${{ secrets.GLUE_ROLE_ARN }}
-      GLUE_JOB_NAME: ${{ secrets.GLUE_JOB_NAME }}
       S3_BUCKET: ${{ secrets.S3_BUCKET }}
 
     steps:
@@ -28,34 +27,42 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload Glue script to S3
+      - name: Upload Glue scripts to S3
         run: |
-          aws s3 cp scripts/cdc_metrics_job.py s3://${{ env.S3_BUCKET }}/scripts/cdc_metrics_job.py
+          for script in cdc_metrics_job_bronze.py cdc_metrics_job_silver.py cdc_metrics_job_gold.py; do
+            aws s3 cp scripts/$script s3://${{ env.S3_BUCKET }}/scripts/$script
+          done
 
-      - name: Inject script path and role into config
+      - name: Deploy each Glue Job
         run: |
-          TEMP_DIR="s3://${{ env.S3_BUCKET }}/glue/temp/"
-          SCRIPT_PATH="s3://${{ env.S3_BUCKET }}/scripts/cdc_metrics_job.py"
+          declare -A jobs=(
+            ["cdc_metrics_job_bronze"]="cdc_metrics_job_bronze.py"
+            ["cdc_metrics_job_silver"]="cdc_metrics_job_silver.py"
+            ["cdc_metrics_job_gold"]="cdc_metrics_job_gold.py"
+          )
 
-          jq \
-            --arg script "$SCRIPT_PATH" \
-            --arg role "$GLUE_ROLE_ARN" \
-            --arg temp "$TEMP_DIR" \
-            '.Command.ScriptLocation = $script
-            | .Role = $role
-            | .DefaultArguments["--TempDir"] = $temp' \
-            glue_jobs/glue_job_config.json > job_config_final.json
+          for job_name in "${!jobs[@]}"; do
+            script_name=${jobs[$job_name]}
+            script_path="s3://${{ env.S3_BUCKET }}/scripts/$script_name"
+            temp_dir="s3://${{ env.S3_BUCKET }}/glue/temp/"
 
-      - name: Deploy Glue Job
-        run: |
-          set -e
-          if aws glue get-job --job-name "$GLUE_JOB_NAME" > /dev/null 2>&1; then
-            echo "Updating existing Glue job..."
-            aws glue update-job --job-name "$GLUE_JOB_NAME" --job-update file://job_config_final.json
-          else
-            echo "Creating new Glue job..."
-            aws glue create-job --name "$GLUE_JOB_NAME" --cli-input-json file://job_config_final.json
-          fi
+            jq \
+              --arg script "$script_path" \
+              --arg role "$GLUE_ROLE_ARN" \
+              --arg temp "$temp_dir" \
+              '.Command.ScriptLocation = $script
+              | .Role = $role
+              | .DefaultArguments["--TempDir"] = $temp' \
+              glue_jobs/glue_job_config.json > job_config_final.json
+
+            if aws glue get-job --job-name "$job_name" > /dev/null 2>&1; then
+              echo "Updating existing Glue job: $job_name"
+              aws glue update-job --job-name "$job_name" --job-update file://job_config_final.json
+            else
+              echo "Creating new Glue job: $job_name"
+              aws glue create-job --name "$job_name" --cli-input-json file://job_config_final.json
+            fi
+          done
 
       - name: ✅ Done
-        run: echo "Glue Job deployed successfully"
+        run: echo "All Glue jobs deployed successfully"
